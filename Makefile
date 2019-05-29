@@ -11,6 +11,7 @@
 # explicitly specified :
 #   USE_EPOLL            : enable epoll() on Linux 2.6. Automatic.
 #   USE_KQUEUE           : enable kqueue() on BSD. Automatic.
+#   USE_EVPORTS          : enable event ports on SunOS systems. Automatic.
 #   USE_MY_EPOLL         : redefine epoll_* syscalls. Automatic.
 #   USE_MY_SPLICE        : redefine the splice syscall if build fails without.
 #   USE_NETFILTER        : enable netfilter on Linux. Automatic.
@@ -47,8 +48,10 @@
 #   USE_RT               : enable it if your system requires -lrt. Automatic on Linux.
 #   USE_DEVICEATLAS      : enable DeviceAtlas api.
 #   USE_51DEGREES        : enable third party device detection library from 51Degrees
+#   USE_WURFL            : enable WURFL detection library from Scientiamobile
 #   USE_SYSTEMD          : enable sd_notify() support.
 #   USE_OBSOLETE_LINKER  : use when the linker fails to emit __start_init/__stop_init
+#   USE_THREAD_DUMP      : use the more advanced thread state dump system. Automatic.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -165,6 +168,7 @@ ERR =
 
 #### May be used to force running a specific set of reg-tests
 REG_TEST_FILES =
+REG_TEST_SCRIPT=./scripts/run-regtests.sh
 
 #### Compiler-specific flags that may be used to disable some negative over-
 # optimization or to silence some warnings. -fno-strict-aliasing is needed with
@@ -206,8 +210,8 @@ SMALL_OPTS =
 #### Debug settings
 # You can enable debugging on specific code parts by setting DEBUG=-DDEBUG_xxx.
 # Currently defined DEBUG macros include DEBUG_FULL, DEBUG_MEMORY, DEBUG_FSM,
-# DEBUG_HASH, DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF and DEBUG_THREAD. Please check
-# sources for exact meaning or do not use at all.
+# DEBUG_HASH, DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF and DEBUG_THREAD, DEBUG_STRICT,
+# DEBUG_DEV. Please check sources for exact meaning or do not use at all.
 DEBUG =
 
 #### Trace options
@@ -281,8 +285,8 @@ use_opts = USE_EPOLL USE_KQUEUE USE_MY_EPOLL USE_MY_SPLICE USE_NETFILTER      \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_VSYSCALL             \
            USE_GETADDRINFO USE_OPENSSL USE_LUA USE_FUTEX USE_ACCEPT4          \
            USE_MY_ACCEPT4 USE_ZLIB USE_SLZ USE_CPU_AFFINITY USE_TFO USE_NS    \
-           USE_DL USE_RT USE_DEVICEATLAS USE_51DEGREES USE_SYSTEMD            \
-           USE_OBSOLETE_LINKER USE_PRCTL
+           USE_DL USE_RT USE_DEVICEATLAS USE_51DEGREES USE_WURFL USE_SYSTEMD  \
+           USE_OBSOLETE_LINKER USE_PRCTL USE_THREAD_DUMP USE_EVPORTS
 
 #### Target system options
 # Depending on the target platform, some options are set, as well as some
@@ -341,15 +345,16 @@ ifeq ($(TARGET),linux2628)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_FUTEX USE_LINUX_TPROXY          \
-    USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL ASSUME_SPLICE_WORKS)
+    USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP)
 endif
 
 # Solaris 8 and above
 ifeq ($(TARGET),solaris)
   # We also enable getaddrinfo() which works since solaris 8.
   set_target_defaults = $(call default_opts, \
-    USE_POLL USE_TPROXY USE_LIBCRYPT USE_CRYPT_H USE_GETADDRINFO USE_THREAD)
-  TARGET_CFLAGS  = -fomit-frame-pointer -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=500 -D__EXTENSIONS__
+    USE_POLL USE_TPROXY USE_LIBCRYPT USE_CRYPT_H USE_GETADDRINFO USE_THREAD \
+    USE_OBSOLETE_LINKER USE_EVPORTS)
+  TARGET_CFLAGS  = -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=500 -D__EXTENSIONS__
   TARGET_LDFLAGS = -lnsl -lsocket
 endif
 
@@ -459,25 +464,8 @@ BUILD_FEATURES := $(foreach opt,$(patsubst USE_%,%,$(use_opts)),$(if $(USE_$(opt
 # possibly be unused though)
 OPTIONS_CFLAGS += $(foreach opt,$(use_opts),$(if $($(opt)),-D$(opt),))
 
-ifneq ($(USE_LINUX_SPLICE),)
-OPTIONS_CFLAGS += -DCONFIG_HAP_LINUX_SPLICE
-endif
-
-ifneq ($(USE_TPROXY),)
-OPTIONS_CFLAGS += -DTPROXY
-endif
-
-ifneq ($(USE_LINUX_TPROXY),)
-OPTIONS_CFLAGS += -DCONFIG_HAP_LINUX_TPROXY
-endif
-
 ifneq ($(USE_LIBCRYPT),)
-OPTIONS_CFLAGS  += -DCONFIG_HAP_CRYPT
 OPTIONS_LDFLAGS += -lcrypt
-endif
-
-ifneq ($(USE_CRYPT_H),)
-OPTIONS_CFLAGS  += -DNEED_CRYPT_H
 endif
 
 ifneq ($(USE_SLZ),)
@@ -497,31 +485,23 @@ OPTIONS_LDFLAGS += $(if $(ZLIB_LIB),-L$(ZLIB_LIB)) -lz
 endif
 
 ifneq ($(USE_POLL),)
-OPTIONS_CFLAGS += -DENABLE_POLL
 OPTIONS_OBJS   += src/ev_poll.o
 endif
 
 ifneq ($(USE_EPOLL),)
-OPTIONS_CFLAGS += -DENABLE_EPOLL
 OPTIONS_OBJS   += src/ev_epoll.o
 endif
 
 ifneq ($(USE_KQUEUE),)
-OPTIONS_CFLAGS += -DENABLE_KQUEUE
 OPTIONS_OBJS   += src/ev_kqueue.o
+endif
+
+ifneq ($(USE_EVPORTS),)
+OPTIONS_OBJS   += src/ev_evports.o
 endif
 
 ifneq ($(USE_VSYSCALL),)
 OPTIONS_OBJS   += src/i386-linux-vsys.o
-OPTIONS_CFLAGS += -DCONFIG_HAP_LINUX_VSYSCALL
-endif
-
-ifneq ($(ASSUME_SPLICE_WORKS),)
-OPTIONS_CFLAGS += -DASSUME_SPLICE_WORKS
-endif
-
-ifneq ($(USE_NETFILTER),)
-OPTIONS_CFLAGS += -DNETFILTER
 endif
 
 ifneq ($(USE_REGPARM),)
@@ -622,6 +602,23 @@ OPTIONS_OBJS    += $(51DEGREES_LIB)/../threading.o
 endif
 
 OPTIONS_LDFLAGS += $(if $(51DEGREES_LIB),-L$(51DEGREES_LIB)) -lm
+endif
+
+ifneq ($(USE_WURFL),)
+# Use WURFL_SRC and possibly WURFL_INC and WURFL_LIB to force path
+# to WURFL headers and libraries if needed.
+WURFL_SRC =
+WURFL_INC = $(WURFL_SRC)
+WURFL_LIB = $(WURFL_SRC)
+OPTIONS_OBJS    += src/wurfl.o
+OPTIONS_CFLAGS  += $(if $(WURFL_INC),-I$(WURFL_INC))
+ifneq ($(WURFL_DEBUG),)
+OPTIONS_CFLAGS  += -DWURFL_DEBUG
+endif
+ifneq ($(WURFL_HEADER_WITH_DETAILS),)
+OPTIONS_CFLAGS  += -DWURFL_HEADER_WITH_DETAILS
+endif
+OPTIONS_LDFLAGS += $(if $(WURFL_LIB),-L$(WURFL_LIB)) -lwurfl
 endif
 
 ifneq ($(USE_SYSTEMD),)
@@ -728,7 +725,6 @@ COPTS += -finstrument-functions
 endif
 
 ifneq ($(USE_NS),)
-OPTIONS_CFLAGS += -DCONFIG_HAP_NS
 OPTIONS_OBJS  += src/namespace.o
 endif
 
@@ -792,7 +788,7 @@ OBJS = src/proto_http.o src/cfgparse-listen.o src/proto_htx.o src/stream.o    \
        src/xxhash.o src/hpack-enc.o src/h2.o src/freq_ctr.o src/lru.o         \
        src/protocol.o src/arg.o src/hpack-huff.o src/hdr_idx.o src/base64.o   \
        src/hash.o src/mailers.o src/activity.o src/http_msg.o src/version.o   \
-       src/mworker.o src/mworker-prog.o
+       src/mworker.o src/mworker-prog.o src/debug.o src/wdt.o
 
 EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o $(EBTREE_DIR)/eb32sctree.o \
               $(EBTREE_DIR)/eb32tree.o $(EBTREE_DIR)/eb64tree.o \
@@ -949,17 +945,19 @@ endif
 
 # Target to run the regression testing script files.
 reg-tests:
-	$(Q)./scripts/run-regtests.sh --LEVEL "$(LEVEL)" $(REGTEST_ARGS) $(REG_TEST_FILES)
+	$(Q)$(REG_TEST_SCRIPT) --type "$(REGTESTS_TYPES)" $(REGTEST_ARGS) $(REG_TEST_FILES)
 .PHONY: $(REGTEST_ARGS)
 
 reg-tests-help:
 	@echo
-	@echo "To launch the reg tests for haproxy, first export to your environment VTEST_PROGRAM variable to point to your vtest program:"
+	@echo "To launch the reg tests for haproxy, first export to your environment "
+	@echo "VTEST_PROGRAM variable to point to your vtest program:"
 	@echo "    $$ export VTEST_PROGRAM=/opt/local/bin/vtest"
 	@echo "or"
 	@echo "    $$ setenv VTEST_PROGRAM /opt/local/bin/vtest"
 	@echo
-	@echo "The same thing may be done to set your haproxy program with HAPROXY_PROGRAM but with ./haproxy as default value."
+	@echo "The same thing may be done to set your haproxy program with HAPROXY_PROGRAM "
+	@echo "but with ./haproxy as default value."
 	@echo
 	@echo "To run all the tests:"
 	@echo "    $$ make reg-tests"
@@ -967,16 +965,23 @@ reg-tests-help:
 	@echo "You can also set the programs to be used on the command line:"
 	@echo "    $$ VTEST_PROGRAM=<...> HAPROXY_PROGRAM=<...> make reg-tests"
 	@echo
-	@echo "To run tests with specific levels:"
-	@echo "    $$ LEVEL=1,3,4   make reg-tests  #list of levels"
-	@echo "    $$ LEVEL=1-3,5-6 make reg-tests  #list of range of levels"
+	@echo "To run tests with specific types:"
+	@echo "    $$ REGTESTS_TYPES=slow,default make reg-tests"
 	@echo
-	@echo "About the levels:"
-	@echo "    LEVEL 1 scripts are dedicated to pure haproxy compliance tests (prefixed with 'h' letter)."
-	@echo "    LEVEL 2 scripts are slow scripts (prefixed with 's' letter)."
-	@echo "    LEVEL 3 scripts are low interest scripts (prefixed with 'l' letter)."
-	@echo "    LEVEL 4 scripts are in relation with bugs they help to reproduce (prefixed with 'b' letter)."
-	@echo "    LEVEL 5 scripts are scripts triggering known broken behaviors for which there is still no fix (prefixed with 'k' letter)."
-	@echo "    LEVEL 6 scripts are experimental, typically used to develop new scripts (prefixed with 'e' lettre)."
+	@echo "with 'any' as default value for REGTESTS_TYPES variable."
+	@echo
+	@echo "About the reg test types:"
+	@echo "    any         : all the tests without distinction (this is the default"
+	@echo "                  value of REGTESTS_TYPES."
+	@echo "    default     : dedicated to pure haproxy compliance tests."
+	@echo "    slow        : scripts which take non negligible time to run."
+	@echo "    bug         : scripts in relation with bugs they help to reproduce."
+	@echo "    broken      : scripts triggering known broken behaviors for which"
+	@echo "                  there is still no fix."
+	@echo "    experimental: for scripts which are experimental, typically used to"
+	@echo "                  develop new scripts."
+	@echo
+	@echo "Note that 'reg-tests' target run '"$(REG_TEST_SCRIPT)"' script"
+	@echo "(see --help option of this script for more information)."
 
 .PHONY: reg-tests reg-tests-help

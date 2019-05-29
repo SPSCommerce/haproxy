@@ -99,6 +99,7 @@ static inline void conn_xprt_close(struct connection *conn)
 	if ((conn->flags & (CO_FL_XPRT_READY|CO_FL_XPRT_TRACKED)) == CO_FL_XPRT_READY) {
 		if (conn->xprt->close)
 			conn->xprt->close(conn, conn->xprt_ctx);
+		conn->xprt_ctx = NULL;
 		conn->flags &= ~CO_FL_XPRT_READY;
 	}
 }
@@ -894,28 +895,28 @@ static inline const char *conn_err_code_str(struct connection *c)
 
 static inline const char *conn_get_ctrl_name(const struct connection *conn)
 {
-	if (!conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn))
 		return "NONE";
 	return conn->ctrl->name;
 }
 
 static inline const char *conn_get_xprt_name(const struct connection *conn)
 {
-	if (!conn_xprt_ready(conn))
+	if (!conn || !conn_xprt_ready(conn))
 		return "NONE";
 	return conn->xprt->name;
 }
 
 static inline const char *conn_get_mux_name(const struct connection *conn)
 {
-	if (!conn->mux)
+	if (!conn || !conn->mux)
 		return "NONE";
 	return conn->mux->name;
 }
 
 static inline const char *cs_get_data_name(const struct conn_stream *cs)
 {
-	if (!cs->data_cb)
+	if (!cs || !cs->data_cb)
 		return "NONE";
 	return cs->data_cb->name;
 }
@@ -1001,8 +1002,8 @@ static inline void list_mux_proto(FILE *out)
 		else
 			side = "NONE";
 
-		fprintf(out, " %15s : mode=%-10s side=%s\n",
-			(proto.len ? proto.ptr : "<default>"), mode, side);
+		fprintf(out, " %15s : mode=%-10s side=%-8s  mux=%s\n",
+			(proto.len ? proto.ptr : "<default>"), mode, side, item->mux->name);
 	}
 }
 
@@ -1098,12 +1099,10 @@ static inline int conn_install_mux_fe(struct connection *conn, void *ctx)
 		int alpn_len = 0;
 		int mode;
 
-		if (bind_conf->frontend->mode == PR_MODE_TCP)
-			mode = PROTO_MODE_TCP;
-		else if (bind_conf->frontend->options2 & PR_O2_USE_HTX)
-			mode = PROTO_MODE_HTX;
+		if (bind_conf->frontend->mode == PR_MODE_HTTP)
+			mode = ((bind_conf->frontend->options2 & PR_O2_USE_HTX) ? PROTO_MODE_HTX : PROTO_MODE_HTTP);
 		else
-			mode = PROTO_MODE_HTTP;
+			mode = PROTO_MODE_TCP;
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);
@@ -1138,12 +1137,10 @@ static inline int conn_install_mux_be(struct connection *conn, void *ctx, struct
 		int alpn_len = 0;
 		int mode;
 
-		if (prx->mode == PR_MODE_TCP)
-			mode = PROTO_MODE_TCP;
-		else if (prx->options2 & PR_O2_USE_HTX)
-			mode = PROTO_MODE_HTX;
+		if (prx->mode == PR_MODE_HTTP)
+			mode = ((prx->options2 & PR_O2_USE_HTX) ? PROTO_MODE_HTX : PROTO_MODE_HTTP);
 		else
-			mode = PROTO_MODE_HTTP;
+			mode = PROTO_MODE_TCP;
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);

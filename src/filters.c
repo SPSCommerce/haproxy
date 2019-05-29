@@ -782,8 +782,7 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 {
 	struct filter *filter;
 	unsigned long long *strm_off = &FLT_STRM_OFF(s, msg->chn);
-	unsigned int out = co_data(msg->chn);
-	int ret = len - out;
+	int ret = len - co_data(msg->chn);
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		/* Call "data" filters only */
@@ -793,7 +792,7 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 			unsigned long long *flt_off = &FLT_OFF(filter, msg->chn);
 			unsigned int offset = *flt_off - *strm_off;
 
-			ret = FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, ret - offset);
+			ret = FLT_OPS(filter)->http_payload(s, filter, msg, offset, ret - offset);
 			if (ret < 0)
 				goto end;
 			*flt_off += ret;
@@ -801,7 +800,6 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 		}
 	}
 	*strm_off += ret;
-
  end:
 	return ret;
 }
@@ -929,17 +927,8 @@ flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_
 		}
 	} RESUME_FILTER_END;
 
-	if (IS_HTX_STRM(s)) {
-		struct htx *htx = htxbuf(&chn->buf);
-		int32_t pos;
-
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-			struct htx_blk *blk = htx_get_blk(htx, pos);
-			c_adv(chn, htx_get_blksz(blk));
-			if (htx_get_blk_type(blk) == HTX_BLK_EOH)
-				break;
-		}
-	}
+	if (IS_HTX_STRM(s))
+		channel_htx_fwd_headers(chn, htxbuf(&chn->buf));
 	else {
 		/* We increase next offset of all "data" filters after all processing on
 		 * headers because any filter can alter them. So the definitive size of

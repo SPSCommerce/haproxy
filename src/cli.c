@@ -66,12 +66,10 @@
 #include <proto/session.h>
 #include <proto/stream.h>
 #include <proto/server.h>
+#include <proto/ssl_sock.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
 #include <proto/proto_udp.h>
-#ifdef USE_OPENSSL
-#include <proto/ssl_sock.h>
-#endif
 
 #define PAYLOAD_PATTERN "<<"
 
@@ -1002,7 +1000,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.iocb == poller_pipe_io_handler) ? "poller_pipe_io_handler" :
 			     (fdt.iocb == mworker_accept_wrapper) ? "mworker_accept_wrapper" :
 #ifdef USE_OPENSSL
-#if (OPENSSL_VERSION_NUMBER >= 0x1010000fL) && !defined(OPENSSL_NO_ASYNC)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x1010000fL) && !defined(OPENSSL_NO_ASYNC)
 			     (fdt.iocb == ssl_async_fd_free) ? "ssl_async_fd_free" :
 			     (fdt.iocb == ssl_async_fd_handler) ? "ssl_async_fd_handler" :
 #endif
@@ -1070,35 +1068,78 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 
 	chunk_reset(&trash);
 
-	chunk_appendf(&trash, "thread_id: %u", tid);
-	chunk_appendf(&trash, "\ndate_now: %lu.%06lu", (long)now.tv_sec, (long)now.tv_usec);
-	chunk_appendf(&trash, "\nloops:");        for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].loops);
-	chunk_appendf(&trash, "\nwake_cache:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_cache);
-	chunk_appendf(&trash, "\nwake_tasks:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_tasks);
-	chunk_appendf(&trash, "\nwake_signal:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_signal);
-	chunk_appendf(&trash, "\npoll_exp:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_exp);
-	chunk_appendf(&trash, "\npoll_drop:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_drop);
-	chunk_appendf(&trash, "\npoll_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_dead);
-	chunk_appendf(&trash, "\npoll_skip:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_skip);
-	chunk_appendf(&trash, "\nfd_skip:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_skip);
-	chunk_appendf(&trash, "\nfd_lock:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_lock);
-	chunk_appendf(&trash, "\nfd_del:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_del);
-	chunk_appendf(&trash, "\nconn_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].conn_dead);
-	chunk_appendf(&trash, "\nstream:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].stream);
-	chunk_appendf(&trash, "\nempty_rq:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].empty_rq);
-	chunk_appendf(&trash, "\nlong_rq:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].long_rq);
-	chunk_appendf(&trash, "\ncpust_ms_tot:"); for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].cpust_total/2);
-	chunk_appendf(&trash, "\ncpust_ms_1s:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", read_freq_ctr(&activity[thr].cpust_1s)/2);
-	chunk_appendf(&trash, "\ncpust_ms_15s:"); for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", read_freq_ctr_period(&activity[thr].cpust_15s, 15000)/2);
-	chunk_appendf(&trash, "\navg_loop_us:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", swrate_avg(activity[thr].avg_loop_us, TIME_STATS_SAMPLES));
-	chunk_appendf(&trash, "\naccepted:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].accepted);
-	chunk_appendf(&trash, "\naccq_pushed:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].accq_pushed);
-	chunk_appendf(&trash, "\naccq_full:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].accq_full);
+#undef SHOW_TOT
+#define SHOW_TOT(t, x)							\
+	do {								\
+		unsigned int _v[MAX_THREADS];				\
+		unsigned int _tot;					\
+		const unsigned int _nbt = global.nbthread;		\
+		for (_tot = t = 0; t < _nbt; t++)			\
+			_tot += _v[t] = (x);				\
+		if (_nbt == 1) {					\
+			chunk_appendf(&trash, " %u\n", _tot);		\
+			break;						\
+		}							\
+		chunk_appendf(&trash, " %u [", _tot);			\
+		for (t = 0; t < _nbt; t++)				\
+			chunk_appendf(&trash, " %u", _v[t]);		\
+		chunk_appendf(&trash, " ]\n");				\
+	} while (0)
+
+#undef SHOW_AVG
+#define SHOW_AVG(t, x)							\
+	do {								\
+		unsigned int _v[MAX_THREADS];				\
+		unsigned int _tot;					\
+		const unsigned int _nbt = global.nbthread;		\
+		for (_tot = t = 0; t < _nbt; t++)			\
+			_tot += _v[t] = (x);				\
+		if (_nbt == 1) {					\
+			chunk_appendf(&trash, " %u\n", _tot);		\
+			break;						\
+		}							\
+		chunk_appendf(&trash, " %u [", (_tot + _nbt/2) / _nbt); \
+		for (t = 0; t < _nbt; t++)				\
+			chunk_appendf(&trash, " %u", _v[t]);		\
+		chunk_appendf(&trash, " ]\n");				\
+	} while (0)
+
+	chunk_appendf(&trash, "thread_id: %u (%u..%u)\n", tid + 1, 1, global.nbthread);
+	chunk_appendf(&trash, "date_now: %lu.%06lu\n", (long)now.tv_sec, (long)now.tv_usec);
+	chunk_appendf(&trash, "loops:");        SHOW_TOT(thr, activity[thr].loops);
+	chunk_appendf(&trash, "wake_cache:");   SHOW_TOT(thr, activity[thr].wake_cache);
+	chunk_appendf(&trash, "wake_tasks:");   SHOW_TOT(thr, activity[thr].wake_tasks);
+	chunk_appendf(&trash, "wake_signal:");  SHOW_TOT(thr, activity[thr].wake_signal);
+	chunk_appendf(&trash, "poll_exp:");     SHOW_TOT(thr, activity[thr].poll_exp);
+	chunk_appendf(&trash, "poll_drop:");    SHOW_TOT(thr, activity[thr].poll_drop);
+	chunk_appendf(&trash, "poll_dead:");    SHOW_TOT(thr, activity[thr].poll_dead);
+	chunk_appendf(&trash, "poll_skip:");    SHOW_TOT(thr, activity[thr].poll_skip);
+	chunk_appendf(&trash, "fd_lock:");      SHOW_TOT(thr, activity[thr].fd_lock);
+	chunk_appendf(&trash, "conn_dead:");    SHOW_TOT(thr, activity[thr].conn_dead);
+	chunk_appendf(&trash, "stream:");       SHOW_TOT(thr, activity[thr].stream);
+	chunk_appendf(&trash, "pool_fail:");    SHOW_TOT(thr, activity[thr].pool_fail);
+	chunk_appendf(&trash, "buf_wait:");     SHOW_TOT(thr, activity[thr].buf_wait);
+	chunk_appendf(&trash, "empty_rq:");     SHOW_TOT(thr, activity[thr].empty_rq);
+	chunk_appendf(&trash, "long_rq:");      SHOW_TOT(thr, activity[thr].long_rq);
+	chunk_appendf(&trash, "ctxsw:");        SHOW_TOT(thr, activity[thr].ctxsw);
+	chunk_appendf(&trash, "tasksw:");       SHOW_TOT(thr, activity[thr].tasksw);
+	chunk_appendf(&trash, "cpust_ms_tot:"); SHOW_TOT(thr, activity[thr].cpust_total / 2);
+	chunk_appendf(&trash, "cpust_ms_1s:");  SHOW_TOT(thr, read_freq_ctr(&activity[thr].cpust_1s) / 2);
+	chunk_appendf(&trash, "cpust_ms_15s:"); SHOW_TOT(thr, read_freq_ctr_period(&activity[thr].cpust_15s, 15000) / 2);
+	chunk_appendf(&trash, "avg_loop_us:");  SHOW_AVG(thr, swrate_avg(activity[thr].avg_loop_us, TIME_STATS_SAMPLES));
+	chunk_appendf(&trash, "accepted:");     SHOW_TOT(thr, activity[thr].accepted);
+	chunk_appendf(&trash, "accq_pushed:");  SHOW_TOT(thr, activity[thr].accq_pushed);
+	chunk_appendf(&trash, "accq_full:");    SHOW_TOT(thr, activity[thr].accq_full);
 #ifdef USE_THREAD
-	chunk_appendf(&trash, "\naccq_ring:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", (accept_queue_rings[thr].tail - accept_queue_rings[thr].head + ACCEPT_QUEUE_SIZE)%ACCEPT_QUEUE_SIZE);
+	chunk_appendf(&trash, "accq_ring:");    SHOW_TOT(thr, (accept_queue_rings[thr].tail - accept_queue_rings[thr].head + ACCEPT_QUEUE_SIZE) % ACCEPT_QUEUE_SIZE);
 #endif
 
-	chunk_appendf(&trash, "\n");
+#if defined(DEBUG_DEV)
+	/* keep these ones at the end */
+	chunk_appendf(&trash, "ctr0:");         SHOW_TOT(thr, activity[thr].ctr0);
+	chunk_appendf(&trash, "ctr1:");         SHOW_TOT(thr, activity[thr].ctr1);
+	chunk_appendf(&trash, "ctr2:");         SHOW_TOT(thr, activity[thr].ctr2);
+#endif
 
 	if (ci_putchk(si_ic(si), &trash) == -1) {
 		chunk_reset(&trash);
@@ -1106,6 +1147,8 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 		si_rx_room_blk(si);
 	}
 
+#undef SHOW_AVG
+#undef SHOW_TOT
 	/* dump complete */
 	return 1;
 }
@@ -1654,7 +1697,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 				memcpy(&tmpfd[i % MAX_SEND_FD], &l->fd, sizeof(l->fd));
 				if (!l->netns)
 					tmpbuf[curoff++] = 0;
-#ifdef CONFIG_HAP_NS
+#ifdef USE_NS
 				else {
 					char *name = l->netns->node.key;
 					unsigned char len = l->netns->name_len;

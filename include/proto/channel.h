@@ -38,6 +38,7 @@
 #include <types/stream.h>
 #include <types/stream_interface.h>
 
+#include <proto/stream.h>
 #include <proto/task.h>
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */
@@ -545,6 +546,7 @@ static inline void channel_check_timeouts(struct channel *chn)
 static inline void channel_erase(struct channel *chn)
 {
 	chn->to_forward = 0;
+	chn->output = 0;
 	b_reset(&chn->buf);
 }
 
@@ -777,6 +779,17 @@ static inline int channel_htx_full(const struct channel *c, const struct htx *ht
 }
 
 
+/* HTX version of channel_recv_max(). */
+static inline int channel_htx_recv_max(const struct channel *chn, const struct htx *htx)
+{
+	int ret;
+
+	ret = channel_htx_recv_limit(chn, htx) - htx_used_space(htx);
+	if (ret < 0)
+		ret = 0;
+	return ret;
+}
+
 /* Returns the amount of space available at the input of the buffer, taking the
  * reserved space into account if ->to_forward indicates that an end of transfer
  * is close to happen. The test is optimized to avoid as many operations as
@@ -786,18 +799,10 @@ static inline int channel_recv_max(const struct channel *chn)
 {
 	int ret;
 
+	if (IS_HTX_STRM(chn_strm(chn)))
+		return channel_htx_recv_max(chn, htxbuf(&chn->buf));
+
 	ret = channel_recv_limit(chn) - b_data(&chn->buf);
-	if (ret < 0)
-		ret = 0;
-	return ret;
-}
-
-/* HTX version of channel_recv_max(). */
-static inline int channel_htx_recv_max(const struct channel *chn, const struct htx *htx)
-{
-	int ret;
-
-	ret = channel_htx_recv_limit(chn, htx) - htx->data;
 	if (ret < 0)
 		ret = 0;
 	return ret;
@@ -903,6 +908,53 @@ static inline void channel_htx_truncate(struct channel *chn, struct htx *htx)
 static inline void channel_slow_realign(struct channel *chn, char *swap)
 {
 	return b_slow_realign(&chn->buf, swap, co_data(chn));
+}
+
+
+/* Forward all headers of an HTX message, starting from the SL to the EOH. This
+ * function also updates the first block position.
+ */
+static inline void channel_htx_fwd_headers(struct channel *chn, struct htx *htx)
+{
+	int32_t pos;
+	size_t  data = 0;
+
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		struct htx_blk *blk = htx_get_blk(htx, pos);
+		data += htx_get_blksz(blk);
+		if (htx_get_blk_type(blk) == HTX_BLK_EOH) {
+			htx->first = htx_get_next(htx, pos);
+			break;
+		}
+	}
+	c_adv(chn, data);
+}
+
+/* Forward <data> bytes of payload of an HTX message. This function also updates
+ * the first block position.
+ */
+static inline void channel_htx_fwd_payload(struct channel *chn, struct htx *htx, size_t data)
+{
+	int32_t pos;
+
+	c_adv(chn, data);
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		uint32_t sz = htx_get_blksz(htx_get_blk(htx, pos));
+
+		if (data < sz)
+			break;
+		data -= sz;
+	}
+	htx->first = pos;
+}
+
+/* Forward all data of an HTX message. This function also updates the first
+ * block position.
+ */
+static inline void channel_htx_fwd_all(struct channel *chn, struct htx *htx)
+{
+	htx->first = -1;
+	c_adv(chn, htx->data - co_data(chn));
 }
 
 /*

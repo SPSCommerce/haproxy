@@ -336,7 +336,6 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	struct cache_st *st = filter->ctx;
 	struct htx *htx = htxbuf(&msg->chn->buf);
 	struct htx_blk *blk;
-	struct htx_ret htx_ret;
 	struct cache_entry *object;
 	int ret, to_forward = 0;
 
@@ -349,15 +348,16 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	}
 	object = (struct cache_entry *)st->first_block->data;
 
-	htx_ret = htx_find_blk(htx, offset);
-	blk = htx_ret.blk;
-	offset = htx_ret.ret;
-
-	while (blk && len) {
+	for (blk = htx_get_first_blk(htx); blk && len; blk = htx_get_next_blk(htx, blk)) {
 		struct shared_block *fb;
 		enum htx_blk_type type = htx_get_blk_type(blk);
 		uint32_t sz = htx_get_blksz(blk);
 		struct ist v;
+
+		if (offset >= sz) {
+			offset -= sz;
+			continue;
+		}
 
 		switch (type) {
 			case HTX_BLK_UNUSED:
@@ -400,7 +400,6 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 		}
 
 		offset = 0;
-		blk  = htx_get_next_blk(htx, blk);
 	}
 
 	return to_forward;
@@ -715,7 +714,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		}
 
 		chunk_reset(&trash);
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk *blk = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
 			uint32_t sz = htx_get_blksz(blk);
@@ -913,10 +912,6 @@ static size_t htx_cache_dump_headers(struct appctx *appctx, struct htx *htx)
 		if (!blk)
 			return 0;
 
-		/* Set the start-line offset */
-		if (type == HTX_BLK_RES_SL)
-			htx->sl_off = blk->addr;
-
 		/* Copy info and data */
 		blk->info = info;
 		memcpy(htx_get_blk_ptr(htx, blk), b_peek(tmp, offset+4), sz);
@@ -962,8 +957,7 @@ static size_t htx_cache_dump_data(struct appctx *appctx, struct htx *htx,
 		sz = MIN(len, shctx->block_size - offset);
 		data = ist2((const char *)shblk->data + offset, sz);
 		if (type == HTX_BLK_DATA) {
-			if (!htx_add_data(htx, data))
-				break;
+			sz = htx_add_data(htx, data);
 		}
 		else { /* HTX_BLK_TLR */
 			if (!htx_add_trailer(htx, data))
@@ -973,7 +967,7 @@ static size_t htx_cache_dump_data(struct appctx *appctx, struct htx *htx,
 		offset += sz;
 		len -= sz;
 		total += sz;
-		if (!len)
+		if (!len || sz < data.len)
 			break;
 		offset = 0;
 	}
@@ -1351,7 +1345,7 @@ int sha1_hosturi(struct stream *s)
 			return 0;
 		chunk_memcat(trash, ctx.value.ptr, ctx.value.len);
 
-		sl = http_find_stline(htx);
+		sl = http_get_stline(htx);
                 path = http_get_path(htx_sl_req_uri(sl));
                 if (!path.ptr)
                         return 0;

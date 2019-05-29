@@ -20,10 +20,11 @@
 #include <eb32sctree.h>
 #include <eb32tree.h>
 
+#include <proto/fd.h>
+#include <proto/freq_ctr.h>
 #include <proto/proxy.h>
 #include <proto/stream.h>
 #include <proto/task.h>
-#include <proto/fd.h>
 
 DECLARE_POOL(pool_head_task,    "task",    sizeof(struct task));
 DECLARE_POOL(pool_head_tasklet, "tasklet", sizeof(struct tasklet));
@@ -44,7 +45,7 @@ unsigned int niced_tasks = 0;      /* number of niced tasks in the run queue */
 THREAD_LOCAL struct task *curr_task = NULL; /* task currently running or NULL */
 
 __decl_aligned_spinlock(rq_lock); /* spin lock related to run queue */
-__decl_aligned_spinlock(wq_lock); /* spin lock related to wait queue */
+__decl_aligned_rwlock(wq_lock);   /* RW lock related to the wait queue */
 
 #ifdef USE_THREAD
 struct eb_root timers;      /* sorted timers tree, global */
@@ -92,7 +93,7 @@ void __task_wakeup(struct task *t, struct eb_root *root)
 		t->rq.key += offset;
 	}
 
-	if (profiling & HA_PROF_TASKS)
+	if (task_profiling_mask & tid_bit)
 		t->call_date = now_mono_time();
 
 	eb32sc_insert(root, &t->rq, t->thread_mask);
@@ -162,6 +163,7 @@ int wake_expired_tasks()
 {
 	struct task *task;
 	struct eb32_node *eb;
+	__decl_hathreads(int key);
 	int ret = TICK_ETERNITY;
 
 	while (1) {
@@ -209,8 +211,31 @@ int wake_expired_tasks()
 	}
 
 #ifdef USE_THREAD
+	if (eb_is_empty(&timers))
+		goto leave;
+
+	HA_RWLOCK_RDLOCK(TASK_WQ_LOCK, &wq_lock);
+	eb = eb32_lookup_ge(&timers, now_ms - TIMER_LOOK_BACK);
+	if (!eb) {
+		eb = eb32_first(&timers);
+		if (likely(!eb)) {
+			HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
+			goto leave;
+		}
+	}
+	key = eb->key;
+	HA_RWLOCK_RDUNLOCK(TASK_WQ_LOCK, &wq_lock);
+
+	if (tick_is_lt(now_ms, key)) {
+		/* timer not expired yet, revisit it later */
+		ret = tick_first(ret, key);
+		goto leave;
+	}
+
+	/* There's really something of interest here, let's visit the queue */
+
 	while (1) {
-		HA_SPIN_LOCK(TASK_WQ_LOCK, &wq_lock);
+		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
   lookup_next:
 		eb = eb32_lookup_ge(&timers, now_ms - TIMER_LOOK_BACK);
 		if (!eb) {
@@ -252,11 +277,12 @@ int wake_expired_tasks()
 			goto lookup_next;
 		}
 		task_wakeup(task, TASK_WOKEN_TIMER);
-		HA_SPIN_UNLOCK(TASK_WQ_LOCK, &wq_lock);
+		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	}
 
-	HA_SPIN_UNLOCK(TASK_WQ_LOCK, &wq_lock);
+	HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 #endif
+leave:
 	return ret;
 }
 
@@ -279,6 +305,8 @@ void process_runnable_tasks()
 	struct eb32sc_node *grq = NULL; // next global run queue entry
 	struct task *t;
 	int max_processed;
+
+	ti->flags &= ~TI_FL_STUCK; // this thread is still running
 
 	if (!(active_tasks_mask & tid_bit)) {
 		activity[tid].empty_rq++;
@@ -344,6 +372,7 @@ void process_runnable_tasks()
 
 		/* And add it to the local task list */
 		task_insert_into_tasklet_list(t);
+		activity[tid].tasksw++;
 	}
 
 	/* release the rqueue lock */
@@ -370,6 +399,8 @@ void process_runnable_tasks()
 		__ha_barrier_atomic_store();
 		__task_remove_from_tasklet_list(t);
 
+		ti->flags &= ~TI_FL_STUCK; // this thread is still running
+		activity[tid].ctxsw++;
 		ctx = t->context;
 		process = t->process;
 		t->calls++;
@@ -382,6 +413,7 @@ void process_runnable_tasks()
 		}
 
 		curr_task = (struct task *)t;
+		__ha_barrier_store();
 		if (likely(process == process_stream))
 			t = process_stream(t, ctx, state);
 		else if (process != NULL)
@@ -389,6 +421,7 @@ void process_runnable_tasks()
 		else {
 			__task_free(t);
 			curr_task = NULL;
+			__ha_barrier_store();
 			/* We don't want max_processed to be decremented if
 			 * we're just freeing a destroyed task, we should only
 			 * do so if we really ran a task.
@@ -396,6 +429,7 @@ void process_runnable_tasks()
 			continue;
 		}
 		curr_task = NULL;
+		__ha_barrier_store();
 		/* If there is a pending state  we have to wake up the task
 		 * immediately, else we defer it into wait queue
 		 */

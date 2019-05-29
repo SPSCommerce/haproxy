@@ -31,6 +31,8 @@
 #include <proto/stick_table.h>
 #include <proto/task.h>
 
+#define IS_HTX_STRM(strm) ((strm)->flags & SF_HTX)
+
 extern struct pool_head *pool_head_stream;
 extern struct list streams;
 
@@ -41,6 +43,8 @@ int stream_create_from_cs(struct conn_stream *cs);
 
 /* kill a stream and set the termination flags to <why> (one of SF_ERR_*) */
 void stream_shutdown(struct stream *stream, int why);
+void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, char eol);
+void stream_dump_and_crash(enum obj_type *obj, int rate);
 
 void stream_process_counters(struct stream *s);
 void sess_change_server(struct stream *sess, struct server *newsrv);

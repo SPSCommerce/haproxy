@@ -1275,9 +1275,7 @@ spoe_release_appctx(struct appctx *appctx)
 	}
 
 	/* Destroy the task attached to this applet */
-	if (spoe_appctx->task) {
-		task_destroy(spoe_appctx->task);
-	}
+	task_destroy(spoe_appctx->task);
 
 	/* Notify all waiting streams */
 	list_for_each_entry_safe(ctx, back, &spoe_appctx->waiting_queue, list) {
@@ -1299,11 +1297,6 @@ spoe_release_appctx(struct appctx *appctx)
 		ctx->status_code = (spoe_appctx->status_code + 0x100);
 		task_wakeup(ctx->strm->task, TASK_WOKEN_MSG);
 	}
-
-	/* Release allocated memory */
-	spoe_release_buffer(&spoe_appctx->buffer,
-			    &spoe_appctx->buffer_wait);
-	pool_free(pool_head_spoe_appctx, spoe_appctx);
 
 	if (!LIST_ISEMPTY(&agent->rt[tid].applets))
 		goto end;
@@ -1329,6 +1322,11 @@ spoe_release_appctx(struct appctx *appctx)
 	}
 
   end:
+	/* Release allocated memory */
+	spoe_release_buffer(&spoe_appctx->buffer,
+			    &spoe_appctx->buffer_wait);
+	pool_free(pool_head_spoe_appctx, spoe_appctx);
+
 	/* Update runtinme agent info */
 	agent->rt[tid].frame_size = agent->max_frame_size;
 	list_for_each_entry(spoe_appctx, &agent->rt[tid].applets, list)
@@ -1943,8 +1941,6 @@ spoe_handle_appctx(struct appctx *appctx)
 
 	if (SPOE_APPCTX(appctx)->task->expire != TICK_ETERNITY)
 		task_queue(SPOE_APPCTX(appctx)->task);
-	si_oc(si)->flags |= CF_READ_DONTWAIT;
-	task_wakeup(si_strm(si)->task, TASK_WOKEN_IO);
 }
 
 struct applet spoe_applet = {
@@ -2184,6 +2180,7 @@ spoe_encode_message(struct stream *s, struct spoe_context *ctx,
 	list_for_each_entry(arg, &msg->args, list) {
 		ctx->frag_ctx.curarg = arg;
 		ctx->frag_ctx.curoff = UINT_MAX;
+		ctx->frag_ctx.curlen = 0;
 
 	  encode_argument:
 		if (ctx->frag_ctx.curoff != UINT_MAX)
@@ -2198,7 +2195,11 @@ spoe_encode_message(struct stream *s, struct spoe_context *ctx,
 
 		/* Fetch the argument value */
 		smp = sample_process(s->be, s->sess, s, dir|SMP_OPT_FINAL, arg->expr, NULL);
-		ret = spoe_encode_data(smp, &ctx->frag_ctx.curoff, buf, end);
+		if (smp) {
+			smp->ctx.a[0] = &ctx->frag_ctx.curlen;
+			smp->ctx.a[1] = &ctx->frag_ctx.curoff;
+		}
+		ret = spoe_encode_data(smp, buf, end);
 		if (ret == -1 || ctx->frag_ctx.curoff)
 			goto too_big;
 	}
@@ -4172,6 +4173,7 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 		arg.type = ARGT_STR;
 		arg.data.str.area = trash.area;
 		arg.data.str.data = trash.data;
+		arg.data.str.size = 0; /* Set it to 0 to not release it in vars_check_args() */
 		if (!vars_check_arg(&arg, err)) {
 			memprintf(err, "SPOE agent '%s': failed to register variable %s.%s (%s)",
 				  curagent->id, curagent->var_pfx, curagent->var_on_error, *err);
@@ -4188,6 +4190,7 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 		arg.type = ARGT_STR;
 		arg.data.str.area = trash.area;
 		arg.data.str.data = trash.data;
+		arg.data.str.size = 0;  /* Set it to 0 to not release it in vars_check_args() */
 		if (!vars_check_arg(&arg, err)) {
 			memprintf(err, "SPOE agent '%s': failed to register variable %s.%s (%s)",
 				  curagent->id, curagent->var_pfx, curagent->var_t_process, *err);
@@ -4204,6 +4207,7 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 		arg.type = ARGT_STR;
 		arg.data.str.area = trash.area;
 		arg.data.str.data = trash.data;
+		arg.data.str.size = 0;  /* Set it to 0 to not release it in vars_check_args() */
 		if (!vars_check_arg(&arg, err)) {
 			memprintf(err, "SPOE agent '%s': failed to register variable %s.%s (%s)",
 				  curagent->id, curagent->var_pfx, curagent->var_t_process, *err);
@@ -4409,6 +4413,7 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 		arg.type = ARGT_STR;
 		arg.data.str.area = trash.area;
 		arg.data.str.data = trash.data;
+		arg.data.str.size = 0;  /* Set it to 0 to not release it in vars_check_args() */
 		if (!vars_check_arg(&arg, err)) {
 			memprintf(err, "SPOE agent '%s': failed to register variable %s.%s (%s)",
 				  curagent->id, curagent->var_pfx, vph->name, *err);

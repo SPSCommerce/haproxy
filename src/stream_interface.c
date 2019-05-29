@@ -30,8 +30,10 @@
 #include <proto/applet.h>
 #include <proto/channel.h>
 #include <proto/connection.h>
+#include <proto/http_htx.h>
 #include <proto/mux_pt.h>
 #include <proto/pipe.h>
+#include <proto/proxy.h>
 #include <proto/stream.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
@@ -595,7 +597,7 @@ static int si_cs_process(struct conn_stream *cs)
 	/* Report EOI on the channel if it was reached from the mux point of
 	 * view. */
 	if ((cs->flags & CS_FL_EOI) && !(ic->flags & CF_EOI))
-		ic->flags |= CF_EOI;
+		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
 
 	/* Second step : update the stream-int and channels, try to forward any
 	 * pending data, then possibly wake the stream up based on the new
@@ -684,6 +686,35 @@ int si_cs_send(struct conn_stream *cs)
 
 		if (oc->flags & CF_STREAMER)
 			send_flag |= CO_SFL_STREAMER;
+
+		if ((si->flags & SI_FL_L7_RETRY) && !b_data(&si->l7_buffer)) {
+			struct stream *s = si_strm(si);
+			/* If we want to be able to do L7 retries, copy
+			 * the data we're about to send, so that we are able
+			 * to resend them if needed
+			 */
+			/* Try to allocate a buffer if we had none.
+			 * If it fails, the next test will just
+			 * disable the l7 retries by setting
+			 * l7_conn_retries to 0.
+			 */
+			if (!s->txn || (s->txn->req.msg_state != HTTP_MSG_DONE))
+				si->flags &= ~SI_FL_L7_RETRY;
+			else {
+				if (b_is_null(&si->l7_buffer))
+					b_alloc(&si->l7_buffer);
+				if (b_is_null(&si->l7_buffer))
+					si->flags &= ~SI_FL_L7_RETRY;
+				else {
+					memcpy(b_orig(&si->l7_buffer),
+					       b_orig(&oc->buf),
+					       b_size(&oc->buf));
+					si->l7_buffer.head = co_data(oc);
+					b_add(&si->l7_buffer, co_data(oc));
+				}
+
+			}
+		}
 
 		ret = cs->conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
@@ -1250,10 +1281,7 @@ int si_cs_recv(struct conn_stream *cs)
 		 * CS_FL_RCV_MORE on the CS if more space is needed.
 		 */
 		max = channel_recv_max(ic);
-		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max,
-		          flags |
-		          (co_data(ic) ? CO_RFL_BUF_WET : 0) |
-		          ((channel_recv_limit(ic) < b_size(&ic->buf)) ? CO_RFL_KEEP_RSV : 0));
+		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, flags | (co_data(ic) ? CO_RFL_BUF_WET : 0));
 
 		if (cs->flags & CS_FL_WANT_ROOM)
 			si_rx_room_blk(si);
@@ -1268,6 +1296,27 @@ int si_cs_recv(struct conn_stream *cs)
 			break;
 		}
 
+		if (si->flags & SI_FL_L7_RETRY) {
+			struct htx *htx;
+			struct htx_sl *sl;
+
+			htx = htxbuf(&ic->buf);
+			if (htx) {
+				sl = http_get_stline(htx);
+				if (sl && l7_status_match(si_strm(si)->be,
+				    sl->info.res.status)) {
+					/* If we got a status for which we would
+					 * like to retry the request, empty
+					 * the buffer and pretend there's an
+					 * error on the channel.
+					 */
+					ic->flags |= CF_READ_ERROR;
+					htx_reset(htx);
+					return 1;
+				}
+			}
+			si->flags &= ~SI_FL_L7_RETRY;
+		}
 		cur_read += ret;
 
 		/* if we're allowed to directly forward data, we must update ->o */
@@ -1434,7 +1483,12 @@ static void stream_int_read0(struct stream_interface *si)
 
 	si_done_get(si);
 
-	si->state = SI_ST_DIS;
+	/* Don't change the state to SI_ST_DIS yet if we're still
+	 * in SI_ST_CON, otherwise it means sess_establish() hasn't
+	 * been called yet, and so the analysers would not run.
+	 */
+	if (si->state == SI_ST_EST)
+		si->state = SI_ST_DIS;
 	si->exp = TICK_ETERNITY;
 	return;
 }

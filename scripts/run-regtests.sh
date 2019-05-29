@@ -28,6 +28,13 @@ _help()
     --vtestparams <ARGS>, passes custom ARGS to vtest
       run-regtests.sh --vtestparams "-n 10"
 
+    --type <reg tests types> filter the types of the tests to be run, depending on
+      the commented REGTESTS_TYPE variable value in each VTC file.
+      The value of REGTESTS_TYPE supported are: default, slow, bug, broken and
+      experimental. When not specified, it is set to 'default' as default value.
+
+      run-regtest.sh --type slow,default
+
     --clean to cleanup previous reg-tests log directories and exit
       run-regtests.sh --clean
 
@@ -42,12 +49,12 @@ _help()
 
   Including text below into a .vtc file will check for its requirements
   related to haproxy's target and compilation options
-    # Below targets are not capable of completing this test succesfully
+    # Below targets are not capable of completing this test successfully
     #EXCLUDE_TARGET=freebsd, abns sockets are not available on freebsd
 
     #EXCLUDE_TARGETS=dos,freebsd,windows
 
-    # Below option is required to complete this test succesfully
+    # Below option is required to complete this test successfully
     #REQUIRE_OPTION=OPENSSL, this test needs OPENSSL compiled in.
 
     #REQUIRE_OPTIONS=ZLIB|SLZ,OPENSSL,LUA
@@ -105,39 +112,6 @@ add_range_to_test_list()
     echo $list
 }
 
-
-build_test_list()
-{
-    # Remove any spacing character
-    LEVEL="$(echo $LEVEL | tr -d ' ')"
-    # Replave any comma character by a space character
-    LEVEL="$(echo $LEVEL | tr ',' ' ')"
-    list=
-    for range in $LEVEL ; do
-        if [ -z "$list" ] ; then
-            list=$(add_range_to_test_list $range)
-        else
-            list="$list $(add_range_to_test_list $range)"
-        fi
-    done
-
-    echo $list
-}
-
-build_find_expr()
-{
-    expr=
-    for i in $@; do
-        if [ -z "$expr" ] ; then
-            expr="-name \"$i\""
-        else
-            expr="$expr -o -name \"$i\""
-        fi
-    done
-
-    echo $expr
-}
-
 _startswith() {
   _str="$1"
   _sub="$2"
@@ -146,20 +120,25 @@ _startswith() {
 
 _findtests() {
   set -f
-  LEVEL=${LEVEL:-0};
-  list=$(build_test_list "$LEVEL")
-  if [ -z "$list" ] ; then
-      echo "Invalid level specification '"$LEVEL"' or no file was found."
-      exit 1
-  fi
-  EXPR=$(build_find_expr $list)
 
-  for i in $( find "$1" $(eval echo $EXPR) ); do
+  REGTESTS_TYPES="${REGTESTS_TYPES:-any}"
+  any_test=$(echo $REGTESTS_TYPES | grep -cw "any")
+  for i in $( find "$1" -name *.vtc ); do
     skiptest=
     require_version="$(sed -ne 's/^#REQUIRE_VERSION=//p' "$i")"
     require_version_below="$(sed -ne 's/^#REQUIRE_VERSION_BELOW=//p' "$i")"
     require_options="$(sed -ne 's/^#REQUIRE_OPTIONS=//p' "$i" | sed  -e 's/,/ /g')"
     exclude_targets="$(sed -ne 's/^#EXCLUDE_TARGETS=//p' "$i" | sed  -e 's/,/ /g')"
+    if [ $any_test -ne 1 ] ; then
+        regtest_type="$(sed -ne 's/^#REGTEST_TYPE=//p' "$i")"
+        if [ -z $regtest_type ] ; then
+            regtest_type=default
+        fi
+        if ! $(echo $REGTESTS_TYPES | grep -wq $regtest_type) ; then
+            echo "  Skip $i because its type '"$regtest_type"' is excluded"
+            skiptest=1
+        fi
+    fi
 
     requiredoption="$(sed -ne 's/^#REQUIRE_OPTION=//p' "$i" | sed  -e 's/,.*//')"
     if [ -n "$requiredoption" ]; then
@@ -264,10 +243,10 @@ _process() {
         --keep-logs)
           keep_logs="-L"
           ;;
-        --LEVEL)
-          LEVEL="$2"
-          shift
-          ;;
+        --type)
+	      REGTESTS_TYPES="$2"
+	      shift
+	      ;;
         --use-htx)
           no_htx=""
           ;;
@@ -353,7 +332,7 @@ if [ $(_version "$HAPROXY_VERSION") -lt $(_version "1.9") ]; then
 fi
 
 if [ -z "$REGTESTS" ]; then
-  _findtests ./
+  _findtests reg-tests/
 else
   for t in $REGTESTS; do
     _findtests $t
@@ -367,7 +346,7 @@ if [ -n "$testlist" ]; then
   if [ -n "$jobcount" ]; then
     jobcount="-j $jobcount"
   fi
-  cmd="$VTEST_PROGRAM -k -t 10 -Dno-htx=${no_htx} $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
+  cmd="$VTEST_PROGRAM -b $((2<<20)) -k -t 10 -Dno-htx=${no_htx} $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
   eval $cmd
   _vtresult=$?
 else
@@ -376,7 +355,7 @@ fi
 
 
 if [ $_vtresult -eq 0 ]; then
-  # all tests were succesfull, removing tempdir (the last part.)
+  # all tests were successful, removing tempdir (the last part.)
   # ignore errors is the directory is not empty or if it does not exist
    rmdir "$TESTDIR" 2>/dev/null
 fi

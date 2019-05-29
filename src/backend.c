@@ -57,11 +57,8 @@
 #include <proto/session.h>
 #include <proto/stream.h>
 #include <proto/stream_interface.h>
-#include <proto/task.h>
-
-#ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
-#endif /* USE_OPENSSL */
+#include <proto/task.h>
 
 int be_lastsession(const struct proxy *be)
 {
@@ -350,7 +347,7 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 
 		p = params = NULL;
 		len = 0;
-		for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+		for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 			enum htx_blk_type type = htx_get_blk_type(blk);
 			struct ist v;
 
@@ -746,7 +743,7 @@ int assign_server(struct stream *s)
 				else {
 					struct ist uri;
 
-					uri = htx_sl_req_uri(http_find_stline(htxbuf(&s->req.buf)));
+					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					srv = get_server_uh(s->be, uri.ptr, uri.len, prev_srv);
 				}
 				break;
@@ -763,7 +760,7 @@ int assign_server(struct stream *s)
 				else {
 					struct ist uri;
 
-					uri = htx_sl_req_uri(http_find_stline(htxbuf(&s->req.buf)));
+					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					srv = get_server_ph(s->be, uri.ptr, uri.len, prev_srv);
 				}
 
@@ -1357,6 +1354,13 @@ int connect_server(struct stream *s)
 			for (i = 0; i < global.nbthread; i++) {
 				if (i == tid)
 					continue;
+
+				// just silence stupid gcc which reports an absurd
+				// out-of-bounds warning for <i> which is always
+				// exactly zero without threads, but it seems to
+				// see it possibly larger.
+				ALREADY_CHECKED(i);
+
 				tokill_conn = LIST_POP_LOCKED(&srv->idle_orphan_conns[i],
 				    struct connection *, list);
 				if (tokill_conn) {
@@ -1406,6 +1410,7 @@ int connect_server(struct stream *s)
 				session_unown_conn(s->sess, old_conn);
 				old_conn->owner = sess;
 				if (!session_add_conn(sess, old_conn, old_conn->target)) {
+					old_conn->flags &= ~CO_FL_SESS_IDLE;
 					old_conn->owner = NULL;
 					old_conn->mux->destroy(old_conn->ctx);
 				} else
@@ -1581,15 +1586,21 @@ int connect_server(struct stream *s)
 	}
 
 
-#ifdef USE_OPENSSL
+#if USE_OPENSSL && (defined(OPENSSL_IS_BORINGSSL) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L))
+
 	if (!reuse && cli_conn && srv &&
 	    (srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA) &&
-		    (cli_conn->flags & CO_FL_EARLY_DATA) &&
-		    !channel_is_empty(si_oc(&s->si[1])) &&
-		    srv_conn->flags & CO_FL_SSL_WAIT_HS) {
+	    /* Only attempt to use early data if either the client sent
+	     * early data, so that we know it can handle a 425, or if
+	     * we are allwoed to retry requests on early data failure, and
+	     * it's our first try
+	     */
+	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
+	     ((s->be->retry_type & PR_RE_EARLY_ERROR) &&
+	      s->si[1].conn_retries == s->be->conn_retries)) &&
+	    !channel_is_empty(si_oc(&s->si[1])) &&
+	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
 		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
-		srv_conn->flags |= CO_FL_EARLY_SSL_HS;
-	}
 #endif
 
 	if (err != SF_ERR_NONE)

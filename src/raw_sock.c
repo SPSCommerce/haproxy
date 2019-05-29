@@ -42,7 +42,7 @@
 #include <types/global.h>
 
 
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_LINUX_SPLICE)
 #include <common/splice.h>
 
 /* A pipe contains 16 segments max, and it's common to see segments of 1448 bytes
@@ -54,12 +54,6 @@
  * infinite forwarding */
 #define MAX_SPLICE_AT_ONCE	(1<<30)
 
-/* Versions of splice between 2.6.25 and 2.6.27.12 were bogus and would return EAGAIN
- * on incoming shutdowns. On these versions, we have to call recv() after such a return
- * in order to find whether splice is OK or not. Since 2.6.27.13 we don't need to do
- * this anymore, and we can avoid this logic by defining ASSUME_SPLICE_WORKS.
- */
-
 /* Returns :
  *   -1 if splice() is not supported
  *   >= 0 to report the amount of spliced bytes.
@@ -68,9 +62,6 @@
  */
 int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
 {
-#ifndef ASSUME_SPLICE_WORKS
-	static THREAD_LOCAL int splice_detects_close;
-#endif
 	int ret;
 	int retval = 0;
 
@@ -109,28 +100,18 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 			     SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 
 		if (ret <= 0) {
-			if (ret == 0) {
-				/* connection closed. This is only detected by
-				 * recent kernels (>= 2.6.27.13). If we notice
-				 * it works, we store the info for later use.
-				 */
-#ifndef ASSUME_SPLICE_WORKS
-				splice_detects_close = 1;
-#endif
+			if (ret == 0)
 				goto out_read0;
-			}
 
 			if (errno == EAGAIN) {
 				/* there are two reasons for EAGAIN :
 				 *   - nothing in the socket buffer (standard)
 				 *   - pipe is full
-				 *   - the connection is closed (kernel < 2.6.27.13)
-				 * The last case is annoying but know if we can detect it
-				 * and if we can't then we rely on the call to recv() to
-				 * get a valid verdict. The difference between the first
-				 * two situations is problematic. Since we don't know if
-				 * the pipe is full, we'll stop if the pipe is not empty.
-				 * Anyway, we will almost always fill/empty the pipe.
+				 * The difference between these two situations
+				 * is problematic. Since we don't know if the
+				 * pipe is full, we'll stop if the pipe is not
+				 * empty. Anyway, we will almost always fill or
+				 * empty the pipe.
 				 */
 				if (pipe->data) {
 					/* alway stop reading until the pipe is flushed */
@@ -138,18 +119,7 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 					break;
 				}
 
-				/* We don't know if the connection was closed,
-				 * but if we know splice detects close, then we
-				 * know it for sure.
-				 * But if we're called upon POLLIN with an empty
-				 * pipe and get EAGAIN, it is suspect enough to
-				 * try to fall back to the normal recv scheme
-				 * which will be able to deal with the situation.
-				 */
-#ifndef ASSUME_SPLICE_WORKS
-				if (splice_detects_close)
-#endif
-					fd_cant_recv(conn->handle.fd); /* we know for sure that it's EAGAIN */
+				fd_cant_recv(conn->handle.fd);
 				break;
 			}
 			else if (errno == ENOSYS || errno == EINVAL || errno == EBADF) {
@@ -188,6 +158,14 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 
  leave:
 	conn_cond_update_sock_polling(conn);
+	if (retval > 0) {
+		/* we count the total bytes sent, and the send rate for 32-byte
+		 * blocks. The reason for the latter is that freq_ctr are
+		 * limited to 4GB and that it's not enough per second.
+		 */
+		_HA_ATOMIC_ADD(&global.out_bytes, retval);
+		update_freq_ctr(&global.out_32bps, (retval + 16) / 32);
+	}
 	return retval;
 
  out_read0:
@@ -237,7 +215,7 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
 	return done;
 }
 
-#endif /* CONFIG_HAP_LINUX_SPLICE */
+#endif /* USE_LINUX_SPLICE */
 
 
 /* Receive up to <count> bytes from connection <conn>'s socket and store them
@@ -402,7 +380,7 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			if (ret < try)
 				break;
 		}
-		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN) {
+		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN || errno == EINPROGRESS) {
 			/* nothing written, we need to poll for write first */
 			fd_cant_send(conn->handle.fd);
 			break;
@@ -416,6 +394,14 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
 	conn_cond_update_sock_polling(conn);
+	if (done > 0) {
+		/* we count the total bytes sent, and the send rate for 32-byte
+		 * blocks. The reason for the latter is that freq_ctr are
+		 * limited to 4GB and that it's not enough per second.
+		 */
+		_HA_ATOMIC_ADD(&global.out_bytes, done);
+		update_freq_ctr(&global.out_32bps, (done + 16) / 32);
+	}
 	return done;
 }
 
@@ -435,7 +421,7 @@ static struct xprt_ops raw_sock = {
 	.rcv_buf  = raw_sock_to_buf,
 	.subscribe = raw_sock_subscribe,
 	.unsubscribe = raw_sock_unsubscribe,
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_LINUX_SPLICE)
 	.rcv_pipe = raw_sock_to_pipe,
 	.snd_pipe = raw_sock_from_pipe,
 #endif

@@ -132,19 +132,7 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * a timeout or connection reset is not counted as an error. However
 	 * a bad request is.
 	 */
-	if (unlikely(htx_is_empty(htx) || htx_get_tail_type(htx) < HTX_BLK_EOH)) {
-		/*
-		 * First catch invalid request because only part of headers have
-		 * been transfered. Multiplexers have the responsibility to emit
-		 * all headers at once.
-		 */
-		if (htx_is_not_empty(htx) || (s->si[0].flags & SI_FL_RXBLK_ROOM)) {
-			stream_inc_http_req_ctr(s);
-			stream_inc_http_err_ctr(s);
-			proxy_inc_fe_req_ctr(sess->fe);
-			goto return_bad_req;
-		}
-
+	if (unlikely(htx_is_empty(htx) || htx->first == -1)) {
 		if (htx->flags & HTX_FL_UPGRADE)
 			goto failed_keep_alive;
 
@@ -291,7 +279,8 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	txn->flags &= ~TX_WAIT_NEXT_RQ;
 	req->analyse_exp = TICK_ETERNITY;
 
-	sl = http_find_stline(htx);
+	BUG_ON(htx_get_first_type(htx) != HTX_BLK_REQ_SL);
+	sl = http_get_stline(htx);
 
 	/* 0: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
@@ -300,7 +289,7 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 
 		htx_debug_stline("clireq", s, sl);
 
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk *blk = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
 
@@ -501,8 +490,10 @@ int htx_process_req_common(struct stream *s, struct channel *req, int an_bit, st
 
 	htx = htxbuf(&req->buf);
 
-	/* just in case we have some per-backend tracking */
-	stream_inc_be_http_req_ctr(s);
+	/* just in case we have some per-backend tracking. Only called the first
+	 * execution of the analyser. */
+	if (!s->current_rule || s->current_rule_list != &px->http_req_rules)
+		stream_inc_be_http_req_ctr(s);
 
 	/* evaluate http-request rules */
 	if (!LIST_ISEMPTY(&px->http_req_rules)) {
@@ -799,7 +790,7 @@ int htx_process_request(struct stream *s, struct channel *req, int an_bit)
 
 			return 0;
 		}
-		sl = http_find_stline(htx);
+		sl = http_get_stline(htx);
 		uri = htx_sl_req_uri(sl);
 		path = http_get_path(uri);
 		if (url2sa(uri.ptr, uri.len - path.len, &conn->addr.to, NULL) == -1)
@@ -1229,12 +1220,12 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		ret  = flt_http_payload(s, msg, htx->data);
 		if (ret < 0)
 			goto return_bad_req;
-		c_adv(req, ret);
+		channel_htx_fwd_payload(req, htx, ret);
 		if (htx->data != co_data(req) || htx->extra)
 			goto missing_data_or_waiting;
 	}
 	else {
-		c_adv(req, htx->data - co_data(req));
+		channel_htx_fwd_all(req, htx);
 		if (msg->flags & HTTP_MSGF_XFER_LEN)
 			channel_htx_forward_forever(req, htx);
 	}
@@ -1384,6 +1375,49 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	return 0;
 }
 
+/* Reset the stream and the backend stream_interface to a situation suitable for attemption connection */
+/* Returns 0 if we can attempt to retry, -1 otherwise */
+static __inline int do_l7_retry(struct stream *s, struct stream_interface *si)
+{
+	struct channel *req, *res;
+	int co_data;
+
+	si->conn_retries--;
+	if (si->conn_retries < 0)
+		return -1;
+
+	if (objt_server(s->target))
+		_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.retries, 1);
+	_HA_ATOMIC_ADD(&s->be->be_counters.retries, 1);
+
+	req = &s->req;
+	res = &s->res;
+	/* Remove any write error from the request, and read error from the response */
+	req->flags &= ~(CF_WRITE_ERROR | CF_WRITE_TIMEOUT | CF_SHUTW | CF_SHUTW_NOW);
+	res->flags &= ~(CF_READ_ERROR | CF_READ_TIMEOUT | CF_SHUTR | CF_EOI | CF_READ_NULL | CF_SHUTR_NOW);
+	res->analysers = 0;
+	si->flags &= ~(SI_FL_ERR | SI_FL_EXP | SI_FL_RXBLK_SHUT);
+	si->state = SI_ST_REQ;
+	si->exp = TICK_ETERNITY;
+	res->rex = TICK_ETERNITY;
+	res->to_forward = 0;
+	res->analyse_exp = TICK_ETERNITY;
+	res->total = 0;
+	s->flags &= ~(SF_ASSIGNED | SF_ADDR_SET | SF_ERR_SRVTO | SF_ERR_SRVCL);
+	si_release_endpoint(&s->si[1]);
+	b_free(&req->buf);
+	/* Swap the L7 buffer with the channel buffer */
+	/* We know we stored the co_data as b_data, so get it there */
+	co_data = b_data(&si->l7_buffer);
+	b_set_data(&si->l7_buffer, b_size(&si->l7_buffer));
+	b_xfer(&req->buf, &si->l7_buffer, b_data(&si->l7_buffer));
+
+	co_set_data(req, co_data);
+	b_reset(&res->buf);
+	co_set_data(res, 0);
+	return 0;
+}
+
 /* This stream analyser waits for a complete HTTP response. It returns 1 if the
  * processing can continue on next analysers, or zero if it either needs more
  * data or wants to immediately abort the response (eg: timeout, error, ...). It
@@ -1404,6 +1438,7 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	struct http_txn *txn = s->txn;
 	struct http_msg *msg = &txn->rsp;
 	struct htx *htx;
+	struct stream_interface *si_b = &s->si[1];
 	struct connection *srv_conn;
 	struct htx_sl *sl;
 	int n;
@@ -1435,19 +1470,27 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * we should only check for HTTP status there, and check I/O
 	 * errors somewhere else.
 	 */
-	if (unlikely(co_data(rep) || htx_is_empty(htx) || htx_get_tail_type(htx) < HTX_BLK_EOH)) {
-		/*
-		 * First catch invalid response because of a parsing error or
-		 * because only part of headers have been transfered.
-		 * Multiplexers have the responsibility to emit all headers at
-		 * once. We must be sure to have forwarded all outgoing data
-		 * first.
-		 */
-		if (!co_data(rep) && (htx_is_not_empty(htx) || (s->si[1].flags & SI_FL_RXBLK_ROOM)))
-			goto return_bad_res;
-
+  next_one:
+	if (unlikely(htx_is_empty(htx) || htx->first == -1)) {
 		/* 1: have we encountered a read error ? */
 		if (rep->flags & CF_READ_ERROR) {
+			struct connection *conn = NULL;
+
+			if (objt_cs(s->si[1].end))
+				conn = objt_cs(s->si[1].end)->conn;
+
+			if (si_b->flags & SI_FL_L7_RETRY &&
+			    (!conn || conn->err_code != CO_ER_SSL_EARLY_FAILED)) {
+				/* If we arrive here, then CF_READ_ERROR was
+				 * set by si_cs_recv() because we matched a
+				 * status, overwise it would have removed
+				 * the SI_FL_L7_RETRY flag, so it's ok not
+				 * to check s->be->retry_type.
+				 */
+				if (co_data(rep) || do_l7_retry(s, si_b) == 0)
+					return 0;
+			}
+
 			if (txn->flags & TX_NOT_FIRST)
 				goto abort_keep_alive;
 
@@ -1463,11 +1506,12 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			/* Check to see if the server refused the early data.
 			 * If so, just send a 425
 			 */
-			if (objt_cs(s->si[1].end)) {
-				struct connection *conn = objt_cs(s->si[1].end)->conn;
-
-				if (conn->err_code == CO_ER_SSL_EARLY_FAILED)
-					txn->status = 425;
+			if (conn->err_code == CO_ER_SSL_EARLY_FAILED) {
+				if ((s->be->retry_type & PR_RE_EARLY_ERROR) &&
+				    (si_b->flags & SI_FL_L7_RETRY) &&
+				    do_l7_retry(s, si_b) == 0)
+					return 0;
+				txn->status = 425;
 			}
 
 			s->si[1].flags |= SI_FL_NOLINGER;
@@ -1482,6 +1526,11 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 2: read timeout : return a 504 to the client. */
 		else if (rep->flags & CF_READ_TIMEOUT) {
+			if ((si_b->flags & SI_FL_L7_RETRY) &&
+			    (s->be->retry_type & PR_RE_TIMEOUT)) {
+				if (co_data(rep) || do_l7_retry(s, si_b) == 0)
+					return 0;
+			}
 			_HA_ATOMIC_ADD(&s->be->be_counters.failed_resp, 1);
 			if (objt_server(s->target)) {
 				_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.failed_resp, 1);
@@ -1522,6 +1571,12 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 4: close from server, capture the response if the server has started to respond */
 		else if (rep->flags & CF_SHUTR) {
+			if ((si_b->flags & SI_FL_L7_RETRY) &&
+			    (s->be->retry_type & PR_RE_DISCONNECTED)) {
+				if (co_data(rep) || do_l7_retry(s, si_b) == 0)
+					return 0;
+			}
+
 			if (txn->flags & TX_NOT_FIRST)
 				goto abort_keep_alive;
 
@@ -1571,7 +1626,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 */
 
 	msg->msg_state = HTTP_MSG_BODY;
-	sl = http_find_stline(htx);
+	BUG_ON(htx_get_first_type(htx) != HTX_BLK_RES_SL);
+	sl = http_get_stline(htx);
 
 	/* 0: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
@@ -1580,7 +1636,7 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		htx_debug_stline("srvrep", s, sl);
 
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk *blk = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
 
@@ -1642,11 +1698,11 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	if (txn->status < 200 &&
 	    (txn->status == 100 || txn->status >= 102)) {
 		FLT_STRM_CB(s, flt_http_reset(s, msg));
-		c_adv(rep, htx->data);
+		channel_htx_fwd_headers(rep, htx);
 		msg->msg_state = HTTP_MSG_RPBEFORE;
 		txn->status = 0;
 		s->logs.t_data = -1; /* was not a response yet */
-		return 0;
+		goto next_one;
 	}
 
 	/*
@@ -1742,6 +1798,10 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.failed_resp, 1);
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 	}
+	if ((s->be->retry_type & PR_RE_JUNK_REQUEST) &&
+	    (si_b->flags & SI_FL_L7_RETRY) &&
+	    do_l7_retry(s, si_b) == 0)
+		return 0;
 	txn->status = 502;
 	s->si[1].flags |= SI_FL_NOLINGER;
 	htx_reply_and_close(s, txn->status, htx_error_message(s));
@@ -2157,12 +2217,12 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 		ret  = flt_http_payload(s, msg, htx->data);
 		if (ret < 0)
 			goto return_bad_res;
-		c_adv(res, ret);
+		channel_htx_fwd_payload(res, htx, ret);
 		if (htx->data != co_data(res) || htx->extra)
 			goto missing_data_or_waiting;
 	}
 	else {
-		c_adv(res, htx->data - co_data(res));
+		channel_htx_fwd_all(res, htx);
 		if (msg->flags & HTTP_MSGF_XFER_LEN)
 			channel_htx_forward_forever(res, htx);
 	}
@@ -2306,6 +2366,7 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 	struct ist status, reason, location;
 	unsigned int flags;
 	size_t data;
+	int close = 0; /* Try to keep the connection alive byt default */
 
 	chunk = alloc_trash_chunk();
 	if (!chunk)
@@ -2325,7 +2386,7 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 			if (http_find_header(htx, ist("Host"), &ctx, 0))
 				host = ctx.value;
 
-			sl = http_find_stline(htx);
+			sl = http_get_stline(htx);
 			path = http_get_path(htx_sl_req_uri(sl));
 			/* build message using path */
 			if (path.ptr) {
@@ -2373,7 +2434,7 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 		case REDIRECT_TYPE_PREFIX: {
 			struct ist path;
 
-			sl = http_find_stline(htx);
+			sl = http_get_stline(htx);
 			path = http_get_path(htx_sl_req_uri(sl));
 			/* build message using path */
 			if (path.ptr) {
@@ -2465,6 +2526,9 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 			break;
 	}
 
+	if (!(txn->req.flags & HTTP_MSGF_BODYLESS) && txn->req.msg_state != HTTP_MSG_DONE)
+		close = 1;
+
 	htx = htx_from_buf(&res->buf);
 	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
@@ -2473,8 +2537,10 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 	sl->info.res.status = rule->code;
 	s->txn->status = rule->code;
 
-	if (!htx_add_header(htx, ist("Connection"), ist("close")) ||
-	    !htx_add_header(htx, ist("Content-length"), ist("0")) ||
+	if (close && !htx_add_header(htx, ist("Connection"), ist("close")))
+		goto fail;
+
+	if (!htx_add_header(htx, ist("Content-length"), ist("0")) ||
 	    !htx_add_header(htx, ist("Location"), location))
 		goto fail;
 
@@ -2824,7 +2890,7 @@ static enum rule_result htx_req_get_intercept_rule(struct proxy *px, struct list
 				if (htx_transform_header(s, &s->req, htx,
 							 ist2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len),
 							 &rule->arg.hdr_add.fmt,
-							 &rule->arg.hdr_add.re, rule->action)) {
+							 rule->arg.hdr_add.re, rule->action)) {
 					rule_ret = HTTP_RULE_RES_BADREQ;
 					goto end;
 				}
@@ -3166,7 +3232,7 @@ resume_execution:
 				if (htx_transform_header(s, &s->res, htx,
 							 ist2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len),
 							 &rule->arg.hdr_add.fmt,
-							 &rule->arg.hdr_add.re, rule->action)) {
+							 rule->arg.hdr_add.re, rule->action)) {
 					rule_ret = HTTP_RULE_RES_BADREQ;
 					goto end;
 				}
@@ -3437,7 +3503,7 @@ static int htx_apply_filter_to_req_headers(struct stream *s, struct channel *req
 
 	htx = htxbuf(&req->buf);
 
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 		struct htx_blk *blk = htx_get_blk(htx, pos);
 		enum htx_blk_type type;
 		struct ist n, v;
@@ -3545,11 +3611,11 @@ static int htx_apply_filter_to_req_line(struct stream *s, struct channel *req, s
 
 	done = 0;
 
-	reqline->data = htx_fmt_req_line(http_find_stline(htx), reqline->area, reqline->size);
+	reqline->data = htx_fmt_req_line(http_get_stline(htx), reqline->area, reqline->size);
 
 	/* Now we have the request line between cur_ptr and cur_end */
 	if (regex_exec_match2(exp->preg, reqline->area, reqline->data, MAX_MATCH, pmatch, 0)) {
-		struct htx_sl *sl = http_find_stline(htx);
+		struct htx_sl *sl = http_get_stline(htx);
 		struct ist meth, uri, vsn;
 		int len;
 
@@ -3655,7 +3721,7 @@ static int htx_apply_filter_to_resp_headers(struct stream *s, struct channel *re
 
 	htx = htxbuf(&res->buf);
 
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 		struct htx_blk *blk = htx_get_blk(htx, pos);
 		enum htx_blk_type type;
 		struct ist n, v;
@@ -3756,11 +3822,11 @@ static int htx_apply_filter_to_sts_line(struct stream *s, struct channel *res, s
 		return 0;
 
 	done = 0;
-	resline->data = htx_fmt_res_line(http_find_stline(htx), resline->area, resline->size);
+	resline->data = htx_fmt_res_line(http_get_stline(htx), resline->area, resline->size);
 
 	/* Now we have the status line between cur_ptr and cur_end */
 	if (regex_exec_match2(exp->preg, resline->area, resline->data, MAX_MATCH, pmatch, 0)) {
-		struct htx_sl *sl = http_find_stline(htx);
+		struct htx_sl *sl = http_get_stline(htx);
 		struct ist vsn, code, reason;
 		int len;
 
@@ -4549,7 +4615,7 @@ void htx_check_request_for_cacheability(struct stream *s, struct channel *req)
 
 	htx = htxbuf(&req->buf);
 	pragma_found = cc_found = 0;
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
                 struct htx_blk *blk = htx_get_blk(htx, pos);
                 enum htx_blk_type type = htx_get_blk_type(blk);
 		struct ist n, v;
@@ -4637,7 +4703,7 @@ void htx_check_response_for_cacheability(struct stream *s, struct channel *res)
 	}
 
 	htx = htxbuf(&res->buf);
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
                 struct htx_blk *blk  = htx_get_blk(htx, pos);
                 enum htx_blk_type type = htx_get_blk_type(blk);
 		struct ist n, v;
@@ -4753,7 +4819,7 @@ static int htx_stats_check_uri(struct stream *s, struct http_txn *txn, struct pr
 		return 0;
 
 	htx = htxbuf(&s->req.buf);
-	sl = http_find_stline(htx);
+	sl = http_get_stline(htx);
 	uri = htx_sl_req_uri(sl);
 
 	/* check URI size */
@@ -4796,7 +4862,7 @@ static int htx_handle_stats(struct stream *s, struct channel *req)
 		appctx->ctx.stats.flags |= STAT_CHUNKED;
 
 	htx = htxbuf(&req->buf);
-	sl = http_find_stline(htx);
+	sl = http_get_stline(htx);
 	lookup = HTX_SL_REQ_UPTR(sl) + uri_auth->uri_len;
 	end = HTX_SL_REQ_UPTR(sl) + HTX_SL_REQ_ULEN(sl);
 
@@ -4949,7 +5015,7 @@ void htx_perform_server_redirect(struct stream *s, struct stream_interface *si)
 
 	/* 2: add the request Path */
 	htx = htxbuf(&req->buf);
-	sl = http_find_stline(htx);
+	sl = http_get_stline(htx);
 	path = http_get_path(htx_sl_req_uri(sl));
 	if (!path.ptr)
 		return;
@@ -5436,7 +5502,18 @@ static int htx_reply_40x_unauthorized(struct stream *s, const char *auth_realm)
 		goto fail;
 	if (status == 407 && !htx_add_header(htx, ist("Proxy-Authenticate"), ist2(trash.area, trash.data)))
 		goto fail;
-	if (!htx_add_endof(htx, HTX_BLK_EOH) || !htx_add_data(htx, body) || !htx_add_endof(htx, HTX_BLK_EOM))
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
+		goto fail;
+
+	while (body.len) {
+		size_t sent = htx_add_data(htx, body);
+		if (!sent)
+			goto fail;
+		body.ptr += sent;
+		body.len -= sent;
+	}
+
+	if (!htx_add_endof(htx, HTX_BLK_EOM))
 		goto fail;
 
 	data = htx->data - co_data(res);
@@ -5470,7 +5547,7 @@ static void htx_capture_headers(struct htx *htx, char **cap, struct cap_hdr *cap
 	struct cap_hdr *h;
 	int32_t pos;
 
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 		struct htx_blk *blk = htx_get_blk(htx, pos);
 		enum htx_blk_type type = htx_get_blk_type(blk);
 		struct ist n, v;

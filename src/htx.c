@@ -28,7 +28,7 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk)
 	struct htx_blk *newblk, *oldblk;
 	uint32_t new, old, blkpos;
 	uint32_t addr, blksz;
-	int32_t sl_off = -1;
+	int32_t first = -1;
 
 	if (!htx->used)
 		return NULL;
@@ -42,19 +42,17 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk)
 	/* start from the head */
 	for (old = htx_get_head(htx); old != -1; old = htx_get_next(htx, old)) {
 		oldblk = htx_get_blk(htx, old);
-		if (htx_get_blk_type(oldblk) == HTX_BLK_UNUSED) {
-			htx->used--;
+		if (htx_get_blk_type(oldblk) == HTX_BLK_UNUSED)
 			continue;
-		}
 
 		newblk = htx_get_blk(tmp, new);
 		newblk->addr = addr;
 		newblk->info = oldblk->info;
 		blksz = htx_get_blksz(oldblk);
 
-		/* update the start-line offset */
-		if (htx->sl_off == oldblk->addr)
-			sl_off = addr;
+		/* update the start-line position */
+		if (htx->first == old)
+			first = new;
 
 		/* if <blk> is defined, set its new position */
 		if (blk != NULL && blk == oldblk)
@@ -64,10 +62,11 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk)
 		new++;
 		addr += blksz;
 
-	} while (new < htx->used);
+	}
 
-	htx->sl_off = sl_off;
-	htx->wrap = htx->used;
+	htx->used = new;
+	htx->first = first;
+	htx->head = 0;
 	htx->front = htx->tail = new - 1;
 	memcpy((void *)htx->blocks, (void *)tmp->blocks, htx->size);
 
@@ -95,8 +94,8 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 
 	if (!htx->used) {
 		/* Empty message */
-		htx->front = htx->tail = 0;
-		htx->wrap  = htx->used = 1;
+		htx->front = htx->head = htx->tail = htx->first = 0;
+		htx->used = 1;
 		blk = htx_get_blk(htx, htx->tail);
 		blk->addr = 0;
 		htx->data = blksz;
@@ -104,10 +103,10 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 	}
 
 	used = htx->used + 1;
-	tail = htx->tail + 1;
 	prev = htx->tail;
-	wrap = htx->wrap;
-	head = htx_get_head(htx);
+	head = htx->head;
+	tail = htx->tail + 1;
+	wrap = htx_get_wrap(htx);
 
 	if (tail == wrap) {
 		frtblk = htx_get_blk(htx, htx->front);
@@ -178,7 +177,6 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 			/* need to defragment the table before inserting upfront */
 			htx_defrag(htx, NULL);
 			frtblk = htx_get_blk(htx, htx->front);
-			wrap = htx->wrap + 1;
 			tail = htx->tail + 1;
 			used = htx->used + 1;
 			blk = htx_get_blk(htx, tail);
@@ -187,10 +185,12 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 		}
 	}
 
-	htx->wrap  = wrap;
 	htx->tail  = tail;
 	htx->used  = used;
 	htx->data += blksz;
+	/* Set first position if not already set */
+	if (htx->first == -1)
+		htx->first = tail;
 	return blk;
 }
 
@@ -216,40 +216,35 @@ struct htx_blk *htx_add_blk(struct htx *htx, enum htx_blk_type type, uint32_t bl
 struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 {
 	enum htx_blk_type type = htx_get_blk_type(blk);
-	uint32_t next, head, pos;
+	uint32_t next, pos, wrap;
 
+	pos  = htx_get_blk_pos(htx, blk);
 	if (type != HTX_BLK_UNUSED) {
 		/* Mark the block as unused, decrement allocated size */
 		htx->data -= htx_get_blksz(blk);
 		blk->info = ((uint32_t)HTX_BLK_UNUSED << 28);
-		if (htx->sl_off == blk->addr)
-			htx->sl_off = -1;
 	}
 
 	/* This is the last block in use */
-	if (htx->used == 1/* || !htx->data */) {
-		htx->front = htx->tail = 0;
-		htx->wrap  = htx->used = 0;
-		htx->data = 0;
+	if (htx->used == 1) {
+		htx_reset(htx);
 		return NULL;
 	}
 
 	/* There is at least 2 blocks, so tail is always >= 0 */
-	pos  = htx_get_blk_pos(htx, blk);
-	head = htx_get_head(htx);
 	blk  = NULL;
 	next = pos + 1; /* By default retrun the next block */
-	if (htx->tail + 1 == htx->wrap) {
+	wrap = htx_get_wrap(htx);
+	if (htx->tail + 1 == wrap) {
 		/* The HTTP message doesn't wrap */
-		if (pos == head) {
-			/* remove the head, so just return the new head */
+		if (pos == htx->head) {
+			/* move the head forward */
 			htx->used--;
-			next = htx_get_head(htx);
+			htx->head++;
 		}
 		else if (pos == htx->tail) {
 			/* remove the tail. this was the last inserted block so
 			 * return NULL. */
-			htx->wrap--;
 			htx->tail--;
 			htx->used--;
 			goto end;
@@ -260,28 +255,24 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 		if (pos == htx->tail) {
 			/* remove the tail. try to unwrap the message (pos == 0)
 			 * and return NULL. */
-			htx->tail = ((pos == 0) ? htx->wrap-1 : htx->tail-1);
+			htx->tail = ((pos == 0) ? wrap-1 : htx->tail-1);
 			htx->used--;
 			goto end;
 		}
-		else if (pos == head) {
-			/* remove the head, try to unwrap the message (pos+1 ==
-			 * wrap) and return the new head */
+		else if (pos == htx->head) {
+			/* move the head forward and try to unwrap the message
+			 * (head+1 == wrap) */
 			htx->used--;
-			if (pos + 1 == htx->wrap)
-				htx->wrap = htx->tail + 1;
-			next = htx_get_head(htx);
+			htx->head++;
+			if (htx->head == wrap)
+				htx->head = next = 0;
 		}
 	}
 
 	blk = htx_get_blk(htx, next);
-	if (htx->sl_off == -1) {
-		/* Try to update the start-line offset, if possible */
-		type = htx_get_blk_type(blk);
-		if (type == HTX_BLK_REQ_SL || type == HTX_BLK_RES_SL)
-			htx->sl_off = blk->addr;
-	}
   end:
+	if (pos == htx->first)
+		htx->first = (blk ? htx_get_blk_pos(htx, blk) : -1);
 	if (pos == htx->front)
 		htx->front = htx_find_front(htx);
 	return blk;
@@ -293,15 +284,20 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 void htx_truncate(struct htx *htx, uint32_t offset)
 {
 	struct htx_blk *blk;
-	struct htx_ret htxret;
 
-	htxret = htx_find_blk(htx, offset);
-	blk = htxret.blk;
-	if (blk && htxret.ret) {
+	for (blk = htx_get_head_blk(htx); blk && offset; blk = htx_get_next_blk(htx, blk)) {
 		uint32_t sz = htx_get_blksz(blk);
+		enum htx_blk_type type = htx_get_blk_type(blk);
 
-		htx_set_blk_value_len(blk, sz - htxret.ret);
-		blk = htx_get_next_blk(htx, blk);
+		if (offset >= sz) {
+			offset -= sz;
+			continue;
+		}
+		if (type == HTX_BLK_DATA || type == HTX_BLK_TLR) {
+			htx_set_blk_value_len(blk, offset);
+			htx->data -= (sz - offset);
+		}
+		offset = 0;
 	}
 	while (blk)
 		blk = htx_remove_blk(htx, blk);
@@ -317,6 +313,12 @@ struct htx_ret htx_drain(struct htx *htx, uint32_t count)
 {
 	struct htx_blk *blk;
 	struct htx_ret htxret = { .blk = NULL, .ret = 0 };
+
+	if (count == htx->data) {
+		htx_reset(htx);
+		htxret.ret = count;
+		return htxret;
+	}
 
 	blk = htx_get_head_blk(htx);
 	while (count && blk) {
@@ -345,13 +347,13 @@ struct htx_ret htx_drain(struct htx *htx, uint32_t count)
 }
 
 /* Tries to append data to the last inserted block, if the type matches and if
- * there is enough non-wrapping space. Only DATA and TRAILERS content can be
- * appended. If the append fails, a new block is inserted. If an error occurred,
- * NULL is returned. Otherwise, on success, the updated block (or the new one)
- * is returned.
-*/
-static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type type,
-					    const struct ist data)
+ * there is enough space to take it all. If the space wraps, the buffer is
+ * defragmented and a new block is inserted. If an error occurred, NULL is
+ * returned. Otherwise, on success, the updated block (or the new one) is
+ * returned. Due to its nature this function can be expensive and should be
+ * avoided whenever possible.
+ */
+struct htx_blk *htx_add_data_atonce(struct htx *htx, const struct ist data)
 {
 	struct htx_blk *blk, *tailblk, *headblk, *frtblk;
 	struct ist v;
@@ -364,10 +366,6 @@ static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type t
 	if (data.len > htx_free_data_space(htx))
 		return NULL;
 
-	/* Append only DATA et TRAILERS data */
-	if (type != HTX_BLK_DATA && type != HTX_BLK_TLR)
-		goto add_new_block;
-
 	/* get the tail and head block */
 	tailblk = htx_get_tail_blk(htx);
 	headblk = htx_get_head_blk(htx);
@@ -376,7 +374,7 @@ static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type t
 
 	/* Don't try to append data if the last inserted block is not of the
 	 * same type */
-	if (type != htx_get_blk_type(tailblk))
+	if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
 		goto add_new_block;
 
 	/*
@@ -410,7 +408,7 @@ static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type t
 
   add_new_block:
 	/* FIXME: check tlr.len (< 256MB) */
-	blk = htx_add_blk(htx, type, data.len);
+	blk = htx_add_blk(htx, HTX_BLK_DATA, data.len);
 	if (!blk)
 		return NULL;
 
@@ -484,9 +482,9 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 }
 
 /* Transfer HTX blocks from <src> to <dst>, stopping on the first block of the
- * type <mark> (typically EOH, EOD or EOM) or when <count> bytes of data were
- * moved. It returns the number of bytes of data moved and the last HTX block
- * inserted in <dst>.
+ * type <mark> (typically EOH, EOD or EOM) or when <count> bytes were moved
+ * (including payload and meta-data). It returns the number of bytes moved and
+ * the last HTX block inserted in <dst>.
  */
 struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 			     enum htx_blk_type mark)
@@ -495,35 +493,42 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 	enum htx_blk_type type;
 	uint32_t	  info, max, sz, ret;
 
-	ret = 0;
+	ret = htx_used_space(dst);
 	blk = htx_get_blk(src, htx_get_head(src));
 	dstblk = NULL;
-	while (blk && ret <= count) {
+
+	while (blk && count) {
 		type = htx_get_blk_type(blk);
 
 		/* Ingore unused block */
 		if (type == HTX_BLK_UNUSED)
 			goto next;
 
-		sz = htx_get_blksz(blk);
-		if (!sz) {
-			dstblk = htx_reserve_nxblk(dst, 0);
-			if (!dstblk)
+		/* Be sure to have enough space to xfer all headers in one
+		 * time. If not while <dst> is empty, we report a parsing error
+		 * on <src>.
+		 */
+		if (mark >= HTX_BLK_EOH && (type == HTX_BLK_REQ_SL || type == HTX_BLK_RES_SL)) {
+			struct htx_sl *sl = htx_get_blk_ptr(src, blk);
+
+			if (sl->hdrs_bytes != -1 && sl->hdrs_bytes > count) {
+				if (htx_is_empty(dst))
+					src->flags |= HTX_FL_PARSING_ERROR;
 				break;
-			dstblk->info = blk->info;
-			goto next;
+			}
 		}
 
+		sz = htx_get_blksz(blk);
 		info = blk->info;
-		max = htx_free_data_space(dst);
-		if (max > count)
-			max = count;
+		max = htx_get_max_blksz(dst, count);
+		if (!max)
+			break;
 		if (sz > max) {
+			/* Headers must be fully copied  */
+			if (type != HTX_BLK_DATA)
+				break;
 			sz = max;
 			info = (type << 28) + sz;
-			/* Headers and pseudo headers must be fully copied  */
-			if (type < HTX_BLK_DATA || !sz)
-				break;
 		}
 
 		dstblk = htx_reserve_nxblk(dst, sz);
@@ -532,18 +537,13 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		dstblk->info = info;
 		memcpy(htx_get_blk_ptr(dst, dstblk), htx_get_blk_ptr(src, blk), sz);
 
-		ret += sz;
+		count -= sizeof(dstblk) + sz;
 		if (blk->info != info) {
 			/* Partial move: don't remove <blk> from <src> but
 			 * resize its content */
-			blk->addr += sz;
-			htx_set_blk_value_len(blk, htx_get_blksz(blk) - sz);
-			src->data -= sz;
+			htx_cut_data_blk(src, blk, sz);
 			break;
 		}
-
-		if (dst->sl_off == -1 && src->sl_off == blk->addr)
-			dst->sl_off = dstblk->addr;
 	  next:
 		blk = htx_remove_blk(src, blk);
 		if (type == mark)
@@ -551,6 +551,8 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 
 	}
 
+  end:
+	ret = htx_used_space(dst) - ret;
 	return (struct htx_ret){.ret = ret, .blk = dstblk};
 }
 
@@ -616,9 +618,6 @@ struct htx_sl *htx_replace_stline(struct htx *htx, struct htx_blk *blk, const st
 	sl = htx_get_blk_ptr(htx, blk);
 	tmp.info = sl->info;
 	tmp.flags = sl->flags;
-	if (htx->sl_off == blk->addr)
-		htx->sl_off = -1;
-
 
 	size = sizeof(*sl) + p1.len + p2.len + p3.len;
 	delta = size - htx_get_blksz(blk);
@@ -646,8 +645,8 @@ struct htx_sl *htx_replace_stline(struct htx *htx, struct htx_blk *blk, const st
 	sl = htx_get_blk_ptr(htx, blk);
 	sl->info = tmp.info;
 	sl->flags = tmp.flags;
-	if (htx->sl_off == -1)
-		htx->sl_off = blk->addr;
+	if (sl->hdrs_bytes != -1)
+		sl->hdrs_bytes += delta;
 
 	HTX_SL_P1_LEN(sl) = p1.len;
 	HTX_SL_P2_LEN(sl) = p2.len;
@@ -682,9 +681,7 @@ struct htx_sl *htx_add_stline(struct htx *htx, enum htx_blk_type type, unsigned 
 	blk->info += size;
 
 	sl = htx_get_blk_ptr(htx, blk);
-	if (htx->sl_off == -1)
-		htx->sl_off = blk->addr;
-
+	sl->hdrs_bytes = -1;
 	sl->flags = flags;
 
 	HTX_SL_P1_LEN(sl) = p1.len;
@@ -743,23 +740,6 @@ struct htx_blk *htx_add_all_headers(struct htx *htx, const struct http_hdr *hdrs
 	}
 	return htx_add_endof(htx, HTX_BLK_EOH);
 }
-/* Adds an HTX block of type PHDR in <htx>. It returns the new block on
- * success. Otherwise, it returns NULL.
- */
-struct htx_blk *htx_add_pseudo_header(struct htx *htx,  enum htx_phdr_type phdr,
-				      const struct ist value)
-{
-	struct htx_blk *blk;
-
-	/* FIXME: check value.len ( < 1MB) */
-	blk = htx_add_blk(htx, HTX_BLK_PHDR, value.len);
-	if (!blk)
-		return NULL;
-
-	blk->info += (value.len << 8) + phdr;
-	memcpy(htx_get_blk_ptr(htx, blk), value.ptr, value.len);
-	return blk;
-}
 
 /* Adds an HTX block of type EOH,EOD or EOM in <htx>. It returns the new block
  * on success. Otherwise, it returns NULL.
@@ -778,36 +758,90 @@ struct htx_blk *htx_add_endof(struct htx *htx, enum htx_blk_type type)
 
 
 /* Adds an HTX block of type DATA in <htx>. It first tries to append data if
- * possible. It returns the new block on success. Otherwise, it returns NULL.
+ * possible. It returns the number of bytes consumed from <data>, which may be
+ * zero if nothing could be copied.
  */
-struct htx_blk *htx_add_data(struct htx *htx, const struct ist data)
+size_t htx_add_data(struct htx *htx, const struct ist data)
 {
-	return htx_append_blk_value(htx, HTX_BLK_DATA, data);
+	struct htx_blk *blk, *tailblk, *headblk, *frtblk;
+	struct ist v;
+	int32_t room;
+	int32_t len = data.len;
+
+	if (!htx->used)
+		goto add_new_block;
+
+	/* Not enough space to store data */
+	if (len > htx_free_data_space(htx))
+		len = htx_free_data_space(htx);
+
+	if (!len)
+		return 0;
+
+	/* get the tail and head block */
+	tailblk = htx_get_tail_blk(htx);
+	headblk = htx_get_head_blk(htx);
+	if (tailblk == NULL || headblk == NULL)
+		goto add_new_block;
+
+	/* Don't try to append data if the last inserted block is not of the
+	 * same type */
+	if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
+		goto add_new_block;
+
+	/*
+	 * Same type and enough space: append data
+	 */
+	frtblk = htx_get_blk(htx, htx->front);
+	if (tailblk->addr >= headblk->addr) {
+		if (htx->tail != htx->front)
+			goto add_new_block;
+		room = sizeof(htx->blocks[0]) * htx_pos_to_idx(htx, htx->tail) - (frtblk->addr + htx_get_blksz(frtblk));
+	}
+	else
+		room = headblk->addr - (tailblk->addr + htx_get_blksz(tailblk));
+
+	if (room < len)
+		len = room;
+
+  append_data:
+	/* get the value of the tail block */
+	/* FIXME: check v.len + len < 256MB */
+	v = htx_get_blk_value(htx, tailblk);
+
+	/* Append data and update the block itself */
+	memcpy(v.ptr + v.len, data.ptr, len);
+	htx_set_blk_value_len(tailblk, v.len + len);
+
+	/* Update HTTP message */
+	htx->data += len;
+	return len;
+
+  add_new_block:
+	/* FIXME: check tlr.len (< 256MB) */
+	blk = htx_add_blk(htx, HTX_BLK_DATA, len);
+	if (!blk)
+		return 0;
+
+	blk->info += len;
+	memcpy(htx_get_blk_ptr(htx, blk), data.ptr, len);
+	return len;
 }
 
-/* Adds an HTX block of type TLR in <htx>. It first tries to append trailers
- * data if possible. It returns the new block on success. Otherwise, it returns
- * NULL.
+/* Adds an HTX block of type TLR in <htx>. It returns the new block on
+ * success. Otherwise, it returns NULL.
  */
 struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist tlr)
 {
-	return htx_append_blk_value(htx, HTX_BLK_TLR, tlr);
-}
-
-/* Adds an HTX block of type OOB in <htx>. It returns the new block on
- * success. Otherwise, it returns NULL.
- */
-struct htx_blk *htx_add_oob(struct htx *htx, const struct ist oob)
-{
 	struct htx_blk *blk;
 
-	/* FIXME: check oob.len (< 256MB) */
-	blk = htx_add_blk(htx, HTX_BLK_OOB, oob.len);
+	/* FIXME: check tlr.len (< 256MB) */
+	blk = htx_add_blk(htx, HTX_BLK_TLR, tlr.len);
 	if (!blk)
 		return NULL;
 
-	blk->info += oob.len;
-	memcpy(htx_get_blk_ptr(htx, blk), oob.ptr, oob.len);
+	blk->info += tlr.len;
+	memcpy(htx_get_blk_ptr(htx, blk), tlr.ptr, tlr.len);
 	return blk;
 }
 

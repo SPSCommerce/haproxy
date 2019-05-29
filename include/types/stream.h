@@ -146,12 +146,16 @@ struct stream {
 	struct list back_refs;          /* list of users tracking this stream */
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 
+	struct freq_ctr call_rate;      /* stream task call rate */
+
 	struct {
 		struct stksess *ts;
 		struct stktable *table;
 	} store[8];                     /* tracked stickiness values to store */
 	int store_count;
-	/* 4 unused bytes here */
+
+	enum obj_type obj_type;         /* object type == OBJ_TYPE_STREAM */
+	/* 3 unused bytes here */
 
 	struct stkctr stkctr[MAX_SESS_STKCTR];  /* content-aware stick counters */
 
@@ -178,6 +182,15 @@ struct stream {
 	struct list *current_rule_list;         /* this is used to store the current executed rule list. */
 	void *current_rule;                     /* this is used to store the current rule to be resumed. */
 	struct hlua *hlua;                      /* lua runtime context */
+
+	/* Context */
+	struct {
+		struct dns_requester *dns_requester; /* owner of the resolution */
+		char *hostname_dn;              /* hostname being resolve, in domain name format */
+		int hostname_dn_len;            /* size of hostname_dn */
+		/* 4 unused bytes here */
+		struct act_rule *parent;        /* rule which requested this resolution */
+	} dns_ctx;                              /* context information for DNS resolution */
 };
 
 #endif /* _TYPES_STREAM_H */
